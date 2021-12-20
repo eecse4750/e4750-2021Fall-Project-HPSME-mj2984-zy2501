@@ -1,4 +1,4 @@
-# e4750_2021Fall_Project
+# e4750-2021Fall-Project-HPSME-mj2984-zy2501
 Seed (team/shared) repo for team projects
   - distributed as Github Repo and shared via Github Classroom
   - contains only README.md file
