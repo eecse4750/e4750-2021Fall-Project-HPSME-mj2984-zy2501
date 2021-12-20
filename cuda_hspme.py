@@ -521,3 +521,17 @@ class Wavelet_Transform():
         cuda.memcpy_dtoh (allmasks_dithers_jitters, allmasks_dithers_jitters_gpu)
         
         return allmasks_dithers_jitters, None, None
+    
+    def oversampling(self, x, oversample_ratio):
+        """
+        A function to do oversample on input x according to oversample ratio
+        """
+        if oversample_ratio == 1:
+            return x
+        else:
+            x_oversampled = np.zeros(len(x)*oversample_ratio, dtype=x.dtype)
+            value_idx = np.arange(len(x)) * oversample_ratio
+            x_oversampled[value_idx] = x
+            
+            return x_oversampled
+        
