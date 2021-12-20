@@ -1,0 +1,379 @@
+#include<stdio.h>
+#define data_size 1024        
+        __constant__ float int_psi[1024];
+        
+        /* ============================== Improved kernel implementation code ======================================== */
+        
+        //improved mask generation kernel
+        __global__
+        void generate_mask_1b1s(int * scales, int * mask_lengths, float * masks, 
+                                const int num_scales, const float step, const int max_length){
+    
+            int bid = blockIdx.x;
+            int tid = threadIdx.x;
+            int sample_point;
+            
+            // read out scale, start point and end point for this block directly
+            int scale = scales[bid];
+            int start_point = mask_lengths[bid];
+            int end_point = mask_lengths[bid+1];
+            // output id should be start point for this block + threadId
+            int idx = start_point + tid;
+
+            // extract respective position;
+            while(idx < end_point){
+                sample_point = tid/(scale*step);
+                masks[idx] = int_psi[sample_point];
+                tid += blockDim.x;
+                idx += blockDim.x;
+            }
+
+        }
+        
+        // improved multi convolutions for small kernels
+        __global__ 
+        void small_mask_multi_convolution(double *input_vector, double *output_matrix, const double * __restrict__ masks, 
+                                          int *masklength_scans, int mask_begin, int mask_end, int input_vector_size){
+            
+            /* This kernel works for convolution of small masks whose mask length is smaller than 1024(full constant
+               memory space), there will at least one mask comes in and do multi convolutions to all of these masks
+               at the same time */
+            
+            int tid = threadIdx.x;
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            
+            /* This tile is defined as [padding of 0(largest_mask_length/2), 
+                                        input_tensor(blockDim.x),
+                                        padding of 0(largest_mask_length/2),
+                                        mask_lengths(num_of_masks),
+                                        mask_lengths_scan(num_of_masks),
+                                        output_tile(num_of_masks*blockDim.x)]     */
+            
+            // --Part1-- Declare shared memory variable
+            // first declare a large shared memory tile, the size will be computed and assigned by the host                           
+            extern __shared__ double tile[];
+            
+            // split first part to save input tensor and padding
+            double * input_tile = &tile[0];
+            
+            // split second part to save mask lengths
+            int largest_mask_length = masklength_scans[mask_end] - masklength_scans[mask_end-1];
+            double * mask_lengths_tile = &tile[blockDim.x + largest_mask_length - 1];
+            
+            // split third part to save mask lengths scan, working as the indicator to find mask element
+            int num_masks = mask_end - mask_begin + 1;
+            double * mask_lengths_scan_tile = &tile[blockDim.x + largest_mask_length - 1 + num_masks];
+            
+            
+            // --Part2-- Load elements to shared memory
+            // load mask_lengths and mask_lengths_scan
+            if(tid < num_masks){
+                mask_lengths_scan_tile[tid] = (double)masklength_scans[mask_begin+tid-1];
+                mask_lengths_tile[tid] = (double)(masklength_scans[mask_begin+tid] - masklength_scans[mask_begin+tid-1]);
+                }
+            
+            // load input tensor
+            int input_start = blockIdx.x * blockDim.x - largest_mask_length/2;
+            int input_end = (blockIdx.x + 1) * blockDim.x + largest_mask_length/2;
+            
+            int iter_tid = tid;
+            int iter_idx = input_start + tid;
+            while(iter_idx < input_end){
+                    
+                if((iter_idx >= 0)&(iter_idx < input_vector_size)){
+                    input_tile[iter_tid] = input_vector[iter_idx];
+                    }
+                else
+                    input_tile[iter_tid] = 0.0;
+                
+                iter_tid += blockDim.x;
+                iter_idx += blockDim.x;
+                
+                
+            }
+            __syncthreads();
+            
+
+            // --Part3-- Do multi-convolution
+            // split fourth part to save output tile and initialize them to all zero
+            double output_reg[64];
+            for(int i=0;i<num_masks;i++)
+                output_reg[i] = 0.0;
+            
+            
+            
+            int largest_n = largest_mask_length/2;
+            int start = tid - largest_n;
+            int end = tid + largest_n;
+            
+                    
+            for(int i=end;i>=start;i--){
+                double input_point = input_tile[i+largest_n];
+                int dis = abs(i-tid);
+                    
+                for(int j=num_masks-1;j>=0;j--){
+                    int mask_n = mask_lengths_tile[j]/2;
+                    
+                    if(dis<=mask_n){
+                        int mask_index = mask_n - (i-tid);
+                        int mask_start = mask_lengths_scan_tile[j];
+                        
+                        output_reg[j] += input_point * masks[mask_start+mask_index];                        
+                    }
+                    else
+                        break;
+                }
+                
+            }
+            
+            __syncthreads();
+            
+            // --Part4-- Write output back
+            for(int i=0;i<num_masks;i++)
+                output_matrix[idx + (mask_begin+i-1) * input_vector_size] = output_reg[i];
+            }
+        
+        
+        // Improved shifted convolutions for sidelobes of large masks
+        // Hardcode with threads number at 512
+        __global__
+        void two_full_sidelobe_convolution(double *input_vector, double *output_matrix, 
+                                           const double * __restrict__ left_mask, double * __restrict__ right_mask, 
+                                           int left_start_point, int right_start_point, int input_vector_size, 
+                                           int org_mask_length){
+            // This kernel will only do two convolutions, each one is fixed 512 elements(half_full_sidelobe)
+            int tid = threadIdx.x;
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            
+            // compute the starting point for left and right mask
+            int full_input_start = - org_mask_length/2;
+            
+            int left_input_start = full_input_start + left_start_point;
+            int right_input_start = full_input_start + right_start_point;
+            
+            // declare shared memory variable to save input vector corresponding
+            // length is fixed at 1024 because mask length is 512 and it should move 512 steps to get output
+            __shared__ double left_input[1024];
+            __shared__ double right_input[1024];
+            
+            // --Part1-- Use two phases to load input vector
+            // phase 1
+            int left_id = left_input_start + idx;
+            int right_id = right_input_start + idx;
+            
+            if((left_id >= 0) & (left_id < input_vector_size))
+                left_input[tid] = input_vector[left_id];
+            else
+                left_input[tid] = 0.0;
+                
+            if((right_id >= 0) & (right_id < input_vector_size))
+                right_input[tid] = input_vector[right_id];
+            else
+                right_input[tid] = 0.0;
+                
+            // phase 2
+            left_id += 512;
+            if((left_id >= 0) & (left_id < input_vector_size))
+                left_input[tid+512] = input_vector[left_id];
+            else
+                left_input[tid+512] = 0.0;
+                
+            right_id += 512;
+            if((right_id >= 0) & (right_id < input_vector_size))
+                right_input[tid+512] = input_vector[right_id];
+            else
+                right_input[tid+512] = 0.0;
+            
+            
+            // --Part2-- Do convolution
+            double temp_left = 0.0;
+            double temp_right = 0.0;
+            
+            for(int i=0;i<512;i++){
+                temp_left += left_input[tid+i] * left_mask[i];
+                temp_right += right_input[tid+i] * right_mask[i];
+            }
+            
+            
+            // --Part3-- Write data back to global memory
+            if(idx < input_vector_size)
+                output_matrix[idx] += temp_left + temp_right;
+            }
+
+        
+        /* ============================== Naive kernel implementation code ======================================== */
+        // naive mask generation kernel code 
+        __global__
+        void generate_mask(float * scales, float * int_psi, float * masks, const int height, const int width, 
+                           const int num_scales, const float step, const int length ){
+    
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            int idy = blockIdx.y * blockDim.y + threadIdx.y;
+            int index = idy * width + idx;
+            int sample_point;
+            
+            
+            if(idy < height){
+                int scale = scales[idy];
+                int mask_length = length * scale + 1;
+                if(idx < mask_length){
+                    sample_point = idx/(scale*step);
+                    masks[index] = int_psi[sample_point];
+                }
+            }
+            
+        }
+        
+        // naive multi convolution kernel code
+        __global__
+        void simple_conv(float * X, float * masks, int * mask_lengths, float * conv_results,
+                         const int height, const int width, const int mask_width){
+            
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            int idy = blockIdx.y * blockDim.y + threadIdx.y;
+            int index = idy * width + idx;
+            
+            if(idy < height){
+               
+                int mask_length = mask_lengths[idy];
+                int start = idx - mask_length/2;
+                float pvalue = 0;
+                for(int i=0; i<mask_length;i++){
+                    if(((start+i)>=0) && ((start+i)<width)){
+                        pvalue += X[start+i] * masks[idy*mask_width+ mask_length - i - 1];
+                    }
+                }
+                
+                if(idx < width)
+                    conv_results[index] = pvalue;
+            }
+        }
+        
+        
+        /* ================================== Experimental Kernel ================================================= */
+        // Kernels following are still experimental, we just have a basic idea, implement them in simple situation, but
+        // did not do a complete test integrated with other parts.
+        // it also includes some utils kernels like scan
+        
+        // scan summer
+        __global__ void prefix_sum_scan_summer(double *a, double *b, int length){
+
+            // Declaring shared memory for a local copy of input data (results will be updated on top of this input data)
+            __shared__ double vector_data[data_size];
+            int index = blockIdx.x * blockDim.x * 2 + threadIdx.x;
+
+            // Copying from Global memory to shared memory and using syncthreads to ensure all cores are done copying the data.
+            if(index < length) {
+                vector_data[threadIdx.x] = a[index];
+                }
+            if(index + blockDim.x < length) {
+                vector_data[threadIdx.x + blockDim.x] = a[index + blockDim.x];
+                }
+            __syncthreads();
+            
+            // Reduction phase
+            for(int stride = 1; stride<= blockDim.x; stride*=2){
+                __syncthreads();
+                int indextemp = (threadIdx.x + 1) * (2*stride) - 1;
+                if(indextemp < data_size) {
+                    vector_data[indextemp] += vector_data[indextemp - stride];
+                    }
+            }
+            
+            // Reverse phase
+            for(int stride = data_size/4; stride>0; stride/=2){
+                __syncthreads();
+                int indextemp = (threadIdx.x + 1) * (2*stride) - 1;
+                if((indextemp + stride) < data_size) {
+                    vector_data[indextemp + stride] += vector_data[indextemp];
+                }
+            }
+            __syncthreads();
+
+            // Writing results back to global memory a
+            if(index < length) {
+                a[index] = vector_data[threadIdx.x];
+                if(index + blockDim.x < length) {
+                    a[index + blockDim.x] = vector_data[threadIdx.x + blockDim.x];
+                }
+            }
+            __syncthreads();
+            
+            // Writing the last entry to global memory b for hierarchical scan
+            if(threadIdx.x == blockDim.x-1) {
+                b[blockIdx.x] = vector_data[data_size - 1];
+            }
+        }
+        
+        // scan distributer
+        __global__
+        void prefix_sum_scan_distributor(double *a, double *b, int length){
+            int index = blockIdx.x * blockDim.x * 2 + threadIdx.x;
+            double temp;
+            // The temp is created to reduce total global memory access.
+            // When blockIdx.x = 0 the kernel doesn't go into if loop so the entire block is freed quickly.
+            // minus 1 in temp because the previous sum needs to be added to all elements of current block.
+            if(blockIdx.x > 0) {
+                temp = b[blockIdx.x - 1];
+                if (index < length) {
+                    a[index] += temp;
+                    if ((index+blockDim.x) < length) {
+                        a[index+blockDim.x] += temp;
+                    }
+                }
+            }
+        }
+        
+        
+        
+
+        __constant__ double mask_generator_parameters[28];
+        
+        __global__ void mask_generate(double *output_masks_amperr_clkerr, int numberofmasks, int multiresolution_function, int sampling_amplitude_error_function, int sampling_clock_error_function){
+            int output_element_id = blockIdx.x * blockDim.x + threadIdx.x;
+            int masksearchindex = numberofmasks-1;
+            int shifter;
+
+            while (output_element_id < mask_generator_parameters[masksearchindex*4]){
+                masksearchindex -= 1;
+            }
+
+            if (masksearchindex < numberofmasks-1){
+                if (masksearchindex == -1){
+                    shifter = 0;
+                }
+                else{
+                    shifter = mask_generator_parameters[masksearchindex*4];
+                }
+                
+                double time_nr = (output_element_id + 1 - shifter - (mask_generator_parameters[(masksearchindex*4)+1]/2))*(mask_generator_parameters[(masksearchindex*4)+3]);
+                double time_dr = mask_generator_parameters[(masksearchindex*4)+2]; //scale_nr
+                double time_mask_sample;
+                double amperr_out;
+                double mask_sample_out;
+                
+                if(sampling_clock_error_function == 0){
+                time_mask_sample = time_nr/time_dr;
+                }
+                else{
+                time_mask_sample = 0.9*time_nr/time_dr;
+                }
+                
+                if(sampling_amplitude_error_function == 0){
+                amperr_out = 0;
+                }
+                else{
+                amperr_out = 0.1;
+                }
+                
+                if(multiresolution_function == 1){
+                mask_sample_out = cos(5*time_mask_sample)*exp(-time_mask_sample*time_mask_sample/2) + amperr_out;;
+                }
+                
+                                
+                // Copying back to global memory
+                output_masks_amperr_clkerr[output_element_id] = mask_sample_out;
+            }
+        }
+            
+        
