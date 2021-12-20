@@ -34,6 +34,8 @@ All kernels are divided into three parts:
 
 `CUDA-HSPME.ipynb` is a jupyter notebook that contains all test code and all results we have got for our final report. It is the best way to run code if you want to reproduce our result.
 
+The test part can be divided into 3 parts, corresponding to section V-B ~ V-D in our final report. First part is test of mask generation. Second part is test of runtime analysis of multiple convolutions. Third part is visualization and numerical analysis of multiple convolutions.
+
 `test_cuda.py` is another choice in case you do not want to run jupyter notebook. It contains all the same code with in CUDA-HSPME.ipynb. You can run it using python3 in command line to get the results. However, the output may be hard to visualize in this way.
 
 `figures` this directory contains all figures we generated for final project
